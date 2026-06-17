@@ -17,16 +17,36 @@ import (
 // Tool: query
 // ---------------------------------------------------------------------------
 
+const (
+	defaultRowLimit   = 100
+	defaultValueLimit = 500
+	maxRowLimit       = 1000
+	maxValueLimit     = 10000
+)
+
 func registerQuery(s *server.MCPServer, db *sql.DB) {
 	tool := mcp.NewTool("query",
 		mcp.WithDescription(
 			"Execute a SQL query and return the results as JSON. "+
 				"Use for SELECT statements or any query that returns rows. "+
-				"For INSERT/UPDATE/DELETE use exec_statement instead.",
+				"For INSERT/UPDATE/DELETE use exec_statement instead. "+
+				fmt.Sprintf("Defaults to %d rows max and %d chars per value to keep responses compact.", defaultRowLimit, defaultValueLimit),
 		),
 		mcp.WithString("sql",
 			mcp.Required(),
 			mcp.Description("The SQL query to execute (SELECT, SHOW, EXPLAIN, etc.)"),
+		),
+		mcp.WithNumber("row_limit",
+			mcp.Description(fmt.Sprintf(
+				"Maximum number of rows to return (default %d, max %d). Use a higher value if you need more.",
+				defaultRowLimit, maxRowLimit,
+			)),
+		),
+		mcp.WithNumber("value_limit",
+			mcp.Description(fmt.Sprintf(
+				"Maximum characters per cell value (default %d, max %d). Longer values are truncated with '[truncated]'.",
+				defaultValueLimit, maxValueLimit,
+			)),
 		),
 	)
 
@@ -36,13 +56,16 @@ func registerQuery(s *server.MCPServer, db *sql.DB) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		rowLimit := clampInt(int(req.GetFloat("row_limit", defaultRowLimit)), 1, maxRowLimit)
+		valueLimit := clampInt(int(req.GetFloat("value_limit", defaultValueLimit)), 1, maxValueLimit)
+
 		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("query error: %v", err)), nil
 		}
 		defer rows.Close()
 
-		result, err := rowsToJSON(rows)
+		result, err := rowsToJSON(rows, rowLimit, valueLimit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("result encoding error: %v", err)), nil
 		}
@@ -227,7 +250,7 @@ func registerDescribeTable(s *server.MCPServer, db *sql.DB) {
 		}
 		defer rows.Close()
 
-		result, err := rowsToJSON(rows)
+		result, err := rowsToJSON(rows, maxRowLimit, maxValueLimit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("result encoding error: %v", err)), nil
 		}
@@ -281,7 +304,7 @@ func RegisterSQLiteDescribeTable(s *server.MCPServer, db *sql.DB) {
 		}
 		defer rows.Close()
 
-		result, err := rowsToJSON(rows)
+		result, err := rowsToJSON(rows, maxRowLimit, maxValueLimit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("result encoding error: %v", err)), nil
 		}
@@ -311,16 +334,37 @@ func RegisterAll(s *server.MCPServer, db *sql.DB, driverName string) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// rowsToJSON converts sql.Rows to a JSON array of objects.
-func rowsToJSON(rows *sql.Rows) (string, error) {
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// rowsToJSON converts sql.Rows to a JSON object containing the result rows,
+// a row count, and a truncated flag if either the row limit or value limit
+// was hit.
+func rowsToJSON(rows *sql.Rows, rowLimit, valueLimit int) (string, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return "", err
 	}
 
 	var results []map[string]any
+	truncatedRows := false
 
 	for rows.Next() {
+		if len(results) >= rowLimit {
+			truncatedRows = true
+			// Drain remaining rows so the connection is released cleanly.
+			for rows.Next() {
+			}
+			break
+		}
+
 		vals := make([]any, len(columns))
 		valPtrs := make([]any, len(columns))
 		for i := range vals {
@@ -338,6 +382,10 @@ func rowsToJSON(rows *sql.Rows) (string, error) {
 			if b, ok := v.([]byte); ok {
 				v = string(b)
 			}
+			// Truncate long string values.
+			if s, ok := v.(string); ok && len(s) > valueLimit {
+				v = s[:valueLimit] + "...[truncated]"
+			}
 			row[col] = v
 		}
 
@@ -352,7 +400,17 @@ func rowsToJSON(rows *sql.Rows) (string, error) {
 		results = []map[string]any{}
 	}
 
-	b, err := json.Marshal(results)
+	type response struct {
+		Rows      []map[string]any `json:"rows"`
+		RowCount  int              `json:"row_count"`
+		Truncated bool             `json:"truncated,omitempty"`
+	}
+
+	b, err := json.Marshal(response{
+		Rows:      results,
+		RowCount:  len(results),
+		Truncated: truncatedRows,
+	})
 	if err != nil {
 		return "", err
 	}
