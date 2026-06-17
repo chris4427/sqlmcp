@@ -321,6 +321,320 @@ func RegisterSQLiteDescribeTable(s *server.MCPServer, db *sql.DB) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: compare_queries
+// ---------------------------------------------------------------------------
+
+func registerCompareQueries(s *server.MCPServer, db *sql.DB) {
+	tool := mcp.NewTool("compare_queries",
+		mcp.WithDescription(`Compare two SQL queries (or stored procedure calls) to verify they return identical results across a set of parameter combinations.
+
+Use this tool to validate that a rewritten or optimized query is semantically equivalent to the original.
+
+IMPORTANT — before calling this tool, gather good test parameters:
+1. Call describe_table on every table involved to understand column types and nullability.
+2. Call query to sample real data for columns used in WHERE clauses or as parameters:
+   - SELECT DISTINCT <col> FROM <table> ORDER BY <col> — for categorical/enum-like columns
+   - SELECT MIN(<col>), MAX(<col>) FROM <table> — for numeric/date ranges
+   - SELECT <col> FROM <table> WHERE <col> IS NULL LIMIT 1 — to confirm NULLs exist
+3. Build parameter sets that cover:
+   - Common/frequent values from the real data
+   - Boundary values (min, max of ranges)
+   - NULL for every nullable parameter
+   - Zero, empty string, and negative numbers where the type allows
+   - At least 10 parameter sets for high confidence; more is better
+
+Placeholders: use {{name}} syntax in both queries. Example:
+  query1: "SELECT * FROM orders WHERE user_id = {{user_id}} AND status = {{status}}"
+  params: [{"user_id": 1, "status": "open"}, {"user_id": 2, "status": null}]
+
+Comparison is order-insensitive: rows and columns are sorted before diffing so
+minor ordering differences do not produce false failures.`),
+		mcp.WithString("query1",
+			mcp.Required(),
+			mcp.Description("The original query or CALL/EXEC statement. Use {{param_name}} placeholders for parameters."),
+		),
+		mcp.WithString("query2",
+			mcp.Required(),
+			mcp.Description("The rewritten/optimized query to compare against query1. Must use the same {{param_name}} placeholders."),
+		),
+		mcp.WithArray("params",
+			mcp.Required(),
+			mcp.Description("Array of parameter objects. Each object maps placeholder names to values. Example: [{\"user_id\": 1, \"status\": \"open\"}, {\"user_id\": 2, \"status\": null}]"),
+			mcp.Items(map[string]any{"type": "object"}),
+		),
+	)
+
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		q1, err := req.RequireString("query1")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		q2, err := req.RequireString("query2")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		// Parse the params array — it comes in as []any where each element is
+		// a map[string]any.
+		rawParams, ok := req.GetArguments()["params"]
+		if !ok {
+			return mcp.NewToolResultError("params is required"), nil
+		}
+		paramSlice, ok := rawParams.([]any)
+		if !ok {
+			return mcp.NewToolResultError("params must be an array of objects"), nil
+		}
+		if len(paramSlice) == 0 {
+			return mcp.NewToolResultError("params must contain at least one parameter set"), nil
+		}
+
+		type runResult struct {
+			ParamSet int            `json:"param_set"`
+			Params   map[string]any `json:"params"`
+			Match    bool           `json:"match"`
+			// Only populated on mismatch or error.
+			Query1Rows int    `json:"query1_rows,omitempty"`
+			Query2Rows int    `json:"query2_rows,omitempty"`
+			Diff       string `json:"diff,omitempty"`
+			Error      string `json:"error,omitempty"`
+		}
+
+		var results []runResult
+		allMatch := true
+
+		for i, p := range paramSlice {
+			params, ok := p.(map[string]any)
+			if !ok {
+				return mcp.NewToolResultError(fmt.Sprintf("params[%d] must be an object", i)), nil
+			}
+
+			r1, err1 := runAndNormalize(ctx, db, q1, params)
+			r2, err2 := runAndNormalize(ctx, db, q2, params)
+
+			res := runResult{
+				ParamSet: i + 1,
+				Params:   params,
+			}
+
+			if err1 != nil || err2 != nil {
+				allMatch = false
+				res.Match = false
+				switch {
+				case err1 != nil && err2 != nil:
+					res.Error = fmt.Sprintf("query1 error: %v | query2 error: %v", err1, err2)
+				case err1 != nil:
+					res.Error = fmt.Sprintf("query1 error: %v", err1)
+				default:
+					res.Error = fmt.Sprintf("query2 error: %v", err2)
+				}
+			} else if r1 != r2 {
+				allMatch = false
+				res.Match = false
+				res.Query1Rows = strings.Count(r1, "\n") + 1
+				res.Query2Rows = strings.Count(r2, "\n") + 1
+				res.Diff = buildDiff(r1, r2)
+			} else {
+				res.Match = true
+			}
+
+			results = append(results, res)
+		}
+
+		type response struct {
+			Match       bool        `json:"match"`
+			TotalSets   int         `json:"total_sets"`
+			PassedSets  int         `json:"passed_sets"`
+			FailedSets  int         `json:"failed_sets"`
+			Results     []runResult `json:"results"`
+		}
+
+		passed := 0
+		for _, r := range results {
+			if r.Match {
+				passed++
+			}
+		}
+
+		// Only include failed results in the output to keep it compact —
+		// the AI doesn't need to see every passing run.
+		var filteredResults []runResult
+		for _, r := range results {
+			if !r.Match {
+				filteredResults = append(filteredResults, r)
+			}
+		}
+		if filteredResults == nil {
+			filteredResults = []runResult{}
+		}
+
+		b, err := json.Marshal(response{
+			Match:      allMatch,
+			TotalSets:  len(results),
+			PassedSets: passed,
+			FailedSets: len(results) - passed,
+			Results:    filteredResults,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("encoding error: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(b)), nil
+	})
+}
+
+// runAndNormalize executes a query with placeholders substituted, drains the
+// rows, and returns a canonical string representation suitable for equality
+// comparison. Rows and columns are both sorted so order does not matter.
+func runAndNormalize(ctx context.Context, db *sql.DB, query string, params map[string]any) (string, error) {
+	q := substitutePlaceholders(query, params)
+
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+
+	// Sort columns alphabetically so column order doesn't matter.
+	sortedCols := make([]string, len(columns))
+	copy(sortedCols, columns)
+	colIndex := make(map[string]int, len(columns))
+	for i, c := range columns {
+		colIndex[c] = i
+	}
+	sortStrings(sortedCols)
+
+	var rowStrings []string
+
+	for rows.Next() {
+		vals := make([]any, len(columns))
+		valPtrs := make([]any, len(columns))
+		for i := range vals {
+			valPtrs[i] = &vals[i]
+		}
+		if err := rows.Scan(valPtrs...); err != nil {
+			return "", err
+		}
+
+		// Build a sorted-column representation of this row.
+		parts := make([]string, len(sortedCols))
+		for i, col := range sortedCols {
+			v := vals[colIndex[col]]
+			if b, ok := v.([]byte); ok {
+				v = string(b)
+			}
+			parts[i] = fmt.Sprintf("%s=%v", col, v)
+		}
+		rowStrings = append(rowStrings, strings.Join(parts, ","))
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	// Sort rows so result order doesn't matter.
+	sortStrings(rowStrings)
+	return strings.Join(rowStrings, "\n"), nil
+}
+
+// substitutePlaceholders replaces {{name}} tokens in query with the
+// corresponding value from params. nil values become NULL.
+func substitutePlaceholders(query string, params map[string]any) string {
+	for k, v := range params {
+		var replacement string
+		if v == nil {
+			replacement = "NULL"
+		} else {
+			switch val := v.(type) {
+			case string:
+				// Escape single quotes to prevent syntax errors.
+				replacement = "'" + strings.ReplaceAll(val, "'", "''") + "'"
+			case bool:
+				if val {
+					replacement = "TRUE"
+				} else {
+					replacement = "FALSE"
+				}
+			default:
+				replacement = fmt.Sprintf("%v", val)
+			}
+		}
+		query = strings.ReplaceAll(query, "{{"+k+"}}", replacement)
+	}
+	return query
+}
+
+// buildDiff returns a human-readable summary of where two normalized result
+// strings diverge, capped to keep output compact.
+func buildDiff(a, b string) string {
+	aLines := strings.Split(a, "\n")
+	bLines := strings.Split(b, "\n")
+
+	aSet := make(map[string]int)
+	bSet := make(map[string]int)
+	for _, l := range aLines {
+		if l != "" {
+			aSet[l]++
+		}
+	}
+	for _, l := range bLines {
+		if l != "" {
+			bSet[l]++
+		}
+	}
+
+	var onlyInA, onlyInB []string
+	for l, n := range aSet {
+		if bSet[l] < n {
+			onlyInA = append(onlyInA, l)
+		}
+	}
+	for l, n := range bSet {
+		if aSet[l] < n {
+			onlyInB = append(onlyInB, l)
+		}
+	}
+	sortStrings(onlyInA)
+	sortStrings(onlyInB)
+
+	const maxLines = 5
+	var parts []string
+	parts = append(parts, fmt.Sprintf("query1 returned %d rows, query2 returned %d rows.", len(aLines), len(bLines)))
+
+	if len(onlyInA) > 0 {
+		sample := onlyInA
+		if len(sample) > maxLines {
+			sample = sample[:maxLines]
+		}
+		parts = append(parts, fmt.Sprintf("Rows only in query1 (showing %d of %d): %s",
+			len(sample), len(onlyInA), strings.Join(sample, " | ")))
+	}
+	if len(onlyInB) > 0 {
+		sample := onlyInB
+		if len(sample) > maxLines {
+			sample = sample[:maxLines]
+		}
+		parts = append(parts, fmt.Sprintf("Rows only in query2 (showing %d of %d): %s",
+			len(sample), len(onlyInB), strings.Join(sample, " | ")))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// sortStrings sorts a string slice in place.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // RegisterWithDriver chooses the correct tool variants based on driver name.
 // ---------------------------------------------------------------------------
 
@@ -329,6 +643,7 @@ func RegisterAll(s *server.MCPServer, db *sql.DB, driverName string, cfg Config)
 	registerQuery(s, db, cfg)
 	registerExecStatement(s, db)
 	registerBenchmarkQuery(s, db)
+	registerCompareQueries(s, db)
 
 	if strings.EqualFold(driverName, "sqlite") {
 		RegisterSQLiteDescribeTable(s, db)
