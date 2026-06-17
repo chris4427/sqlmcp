@@ -1,0 +1,10 @@
+# Built binary
+sqlmcp
+
+# opencode local config (contains your DSN / credentials)
+opencode.json
+
+# Common editor/OS noise
+.DS_Store
+*.swp
+*.swo
