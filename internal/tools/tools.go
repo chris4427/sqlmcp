@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -409,58 +410,90 @@ minor ordering differences do not produce false failures.`),
 			Match    bool           `json:"match"`
 			// Only populated on mismatch or error.
 			Query1Rows int    `json:"query1_rows,omitempty"`
-			Query2Rows int    `json:"query2_rows,omitempty"`
+			Query2Rows int    `json:"query2Rows,omitempty"`
 			Diff       string `json:"diff,omitempty"`
 			Error      string `json:"error,omitempty"`
 		}
 
-		var results []runResult
-		allMatch := true
-
+		// Validate all param sets up front before spawning goroutines.
+		paramMaps := make([]map[string]any, len(paramSlice))
 		for i, p := range paramSlice {
 			params, ok := p.(map[string]any)
 			if !ok {
 				return mcp.NewToolResultError(fmt.Sprintf("params[%d] must be an object", i)), nil
 			}
-
-			r1, err1 := runAndNormalize(ctx, db, q1, params)
-			r2, err2 := runAndNormalize(ctx, db, q2, params)
-
-			res := runResult{
-				ParamSet: i + 1,
-				Params:   params,
-			}
-
-			if err1 != nil || err2 != nil {
-				allMatch = false
-				res.Match = false
-				switch {
-				case err1 != nil && err2 != nil:
-					res.Error = fmt.Sprintf("query1 error: %v | query2 error: %v", err1, err2)
-				case err1 != nil:
-					res.Error = fmt.Sprintf("query1 error: %v", err1)
-				default:
-					res.Error = fmt.Sprintf("query2 error: %v", err2)
-				}
-			} else if r1 != r2 {
-				allMatch = false
-				res.Match = false
-				res.Query1Rows = strings.Count(r1, "\n") + 1
-				res.Query2Rows = strings.Count(r2, "\n") + 1
-				res.Diff = buildDiff(r1, r2)
-			} else {
-				res.Match = true
-			}
-
-			results = append(results, res)
+			paramMaps[i] = params
 		}
 
+		// Run all param sets concurrently. Cap at 10 concurrent DB round-trips
+		// to avoid overwhelming the connection pool.
+		const maxConcurrent = 10
+		sem := make(chan struct{}, maxConcurrent)
+		results := make([]runResult, len(paramMaps))
+		var wg sync.WaitGroup
+
+		for i, params := range paramMaps {
+			wg.Add(1)
+			go func(i int, params map[string]any) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				res := runResult{ParamSet: i + 1, Params: params}
+
+				// Run query1 and query2 concurrently within this param set.
+				type queryResult struct {
+					out string
+					err error
+				}
+				ch1 := make(chan queryResult, 1)
+				ch2 := make(chan queryResult, 1)
+
+				go func() {
+					out, err := runAndNormalize(ctx, db, q1, params)
+					ch1 <- queryResult{out, err}
+				}()
+				go func() {
+					out, err := runAndNormalize(ctx, db, q2, params)
+					ch2 <- queryResult{out, err}
+				}()
+
+				qr1 := <-ch1
+				qr2 := <-ch2
+
+				if qr1.err != nil || qr2.err != nil {
+					res.Match = false
+					switch {
+					case qr1.err != nil && qr2.err != nil:
+						res.Error = fmt.Sprintf("query1 error: %v | query2 error: %v", qr1.err, qr2.err)
+					case qr1.err != nil:
+						res.Error = fmt.Sprintf("query1 error: %v", qr1.err)
+					default:
+						res.Error = fmt.Sprintf("query2 error: %v", qr2.err)
+					}
+				} else if qr1.out != qr2.out {
+					res.Match = false
+					res.Query1Rows = strings.Count(qr1.out, "\n") + 1
+					res.Query2Rows = strings.Count(qr2.out, "\n") + 1
+					res.Diff = buildDiff(qr1.out, qr2.out)
+				} else {
+					res.Match = true
+				}
+
+				results[i] = res
+			}(i, params)
+		}
+
+		wg.Wait()
+
+		wg.Wait()
+
 		type response struct {
-			Match       bool        `json:"match"`
-			TotalSets   int         `json:"total_sets"`
-			PassedSets  int         `json:"passed_sets"`
-			FailedSets  int         `json:"failed_sets"`
-			Results     []runResult `json:"results"`
+			Match      bool        `json:"match"`
+			TotalSets  int         `json:"total_sets"`
+			PassedSets int         `json:"passed_sets"`
+			FailedSets int         `json:"failed_sets"`
+			Results    []runResult `json:"results"`
 		}
 
 		passed := 0
@@ -483,7 +516,7 @@ minor ordering differences do not produce false failures.`),
 		}
 
 		b, err := json.Marshal(response{
-			Match:      allMatch,
+			Match:      passed == len(results),
 			TotalSets:  len(results),
 			PassedSets: passed,
 			FailedSets: len(results) - passed,
