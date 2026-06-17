@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/cray/sqlmcp/internal/tools"
 )
 
 // Run runs the interactive setup wizard and writes the MCP client config.
@@ -52,8 +54,26 @@ func Run(binaryPath string) error {
 	}
 	fmt.Println()
 
-	// 4. Write config
-	snippet := buildSnippet(client, binaryPath, driver, dsn)
+	// 4. Optional limits
+	fmt.Println("Query output limits (press Enter to keep defaults):")
+	rowLimit, err := s.optionalInt(
+		fmt.Sprintf("Max rows per query result (default %d)", tools.DefaultRowLimit),
+		tools.DefaultRowLimit,
+	)
+	if err != nil {
+		return err
+	}
+	valueLimit, err := s.optionalInt(
+		fmt.Sprintf("Max characters per cell value (default %d)", tools.DefaultValueLimit),
+		tools.DefaultValueLimit,
+	)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+
+	// 5. Write config
+	snippet := buildSnippet(client, binaryPath, driver, dsn, rowLimit, valueLimit)
 
 	switch client {
 	case "Claude Desktop":
@@ -84,8 +104,18 @@ func Run(binaryPath string) error {
 // Config builders
 // ---------------------------------------------------------------------------
 
-func buildSnippet(client, binaryPath, driver, dsn string) string {
-	args, _ := json.Marshal([]string{binaryPath, "-driver", driver, "-dsn", dsn})
+func buildSnippet(client, binaryPath, driver, dsn string, rowLimit, valueLimit int) string {
+	args := []string{binaryPath, "-driver", driver, "-dsn", dsn}
+
+	// Only include limit flags when they differ from the defaults.
+	if rowLimit != tools.DefaultRowLimit {
+		args = append(args, "-row-limit", fmt.Sprintf("%d", rowLimit))
+	}
+	if valueLimit != tools.DefaultValueLimit {
+		args = append(args, "-value-limit", fmt.Sprintf("%d", valueLimit))
+	}
+
+	argsJSON, _ := json.Marshal(args)
 
 	switch client {
 	case "opencode":
@@ -98,16 +128,19 @@ func buildSnippet(client, binaryPath, driver, dsn string) string {
       "enabled": true
     }
   }
-}`, string(args))
+}`, string(argsJSON))
 	default:
+		// For other clients, build args without the binary path.
+		otherArgs := args[1:]
+		otherArgsJSON, _ := json.Marshal(otherArgs)
 		return fmt.Sprintf(`{
   "mcpServers": {
     "sqlmcp": {
       "command": %q,
-      "args": ["-driver", %q, "-dsn", %q]
+      "args": %s
     }
   }
-}`, binaryPath, driver, dsn)
+}`, binaryPath, string(otherArgsJSON))
 	}
 }
 
@@ -223,4 +256,23 @@ func (s *scanner) prompt(label, defaultVal string) (string, error) {
 		}
 		fmt.Println("  This field is required.")
 	}
+}
+
+// optionalInt prompts for an integer, returning defaultVal if the user presses Enter.
+func (s *scanner) optionalInt(label string, defaultVal int) (int, error) {
+	fmt.Printf("%s: ", label)
+	line, err := s.r.ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return defaultVal, nil
+	}
+	var n int
+	if _, err := fmt.Sscanf(line, "%d", &n); err != nil || n < 1 {
+		fmt.Printf("  Invalid value, using default (%d).\n", defaultVal)
+		return defaultVal, nil
+	}
+	return n, nil
 }

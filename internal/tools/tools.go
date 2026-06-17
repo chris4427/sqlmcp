@@ -18,19 +18,26 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	defaultRowLimit   = 100
-	defaultValueLimit = 500
+	DefaultRowLimit   = 100
+	DefaultValueLimit = 500
 	maxRowLimit       = 1000
 	maxValueLimit     = 10000
 )
 
-func registerQuery(s *server.MCPServer, db *sql.DB) {
+// Config holds server-wide defaults for query output limits.
+// Individual tool calls may override these per-request.
+type Config struct {
+	DefaultRowLimit   int
+	DefaultValueLimit int
+}
+
+func registerQuery(s *server.MCPServer, db *sql.DB, cfg Config) {
 	tool := mcp.NewTool("query",
 		mcp.WithDescription(
 			"Execute a SQL query and return the results as JSON. "+
 				"Use for SELECT statements or any query that returns rows. "+
 				"For INSERT/UPDATE/DELETE use exec_statement instead. "+
-				fmt.Sprintf("Defaults to %d rows max and %d chars per value to keep responses compact.", defaultRowLimit, defaultValueLimit),
+				fmt.Sprintf("Defaults to %d rows max and %d chars per value to keep responses compact.", cfg.DefaultRowLimit, cfg.DefaultValueLimit),
 		),
 		mcp.WithString("sql",
 			mcp.Required(),
@@ -39,13 +46,13 @@ func registerQuery(s *server.MCPServer, db *sql.DB) {
 		mcp.WithNumber("row_limit",
 			mcp.Description(fmt.Sprintf(
 				"Maximum number of rows to return (default %d, max %d). Use a higher value if you need more.",
-				defaultRowLimit, maxRowLimit,
+				cfg.DefaultRowLimit, maxRowLimit,
 			)),
 		),
 		mcp.WithNumber("value_limit",
 			mcp.Description(fmt.Sprintf(
 				"Maximum characters per cell value (default %d, max %d). Longer values are truncated with '[truncated]'.",
-				defaultValueLimit, maxValueLimit,
+				cfg.DefaultValueLimit, maxValueLimit,
 			)),
 		),
 	)
@@ -56,8 +63,8 @@ func registerQuery(s *server.MCPServer, db *sql.DB) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		rowLimit := clampInt(int(req.GetFloat("row_limit", defaultRowLimit)), 1, maxRowLimit)
-		valueLimit := clampInt(int(req.GetFloat("value_limit", defaultValueLimit)), 1, maxValueLimit)
+		rowLimit := clampInt(int(req.GetFloat("row_limit", float64(cfg.DefaultRowLimit))), 1, maxRowLimit)
+		valueLimit := clampInt(int(req.GetFloat("value_limit", float64(cfg.DefaultValueLimit))), 1, maxValueLimit)
 
 		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
@@ -318,8 +325,8 @@ func RegisterSQLiteDescribeTable(s *server.MCPServer, db *sql.DB) {
 // ---------------------------------------------------------------------------
 
 // RegisterAll registers all tools, selecting driver-appropriate variants.
-func RegisterAll(s *server.MCPServer, db *sql.DB, driverName string) {
-	registerQuery(s, db)
+func RegisterAll(s *server.MCPServer, db *sql.DB, driverName string, cfg Config) {
+	registerQuery(s, db, cfg)
 	registerExecStatement(s, db)
 	registerBenchmarkQuery(s, db)
 
