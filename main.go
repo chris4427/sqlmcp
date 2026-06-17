@@ -13,7 +13,9 @@ import (
 	"github.com/cray/sqlmcp/internal/tools"
 )
 
-const version = "0.1.0"
+// version is set at build time via -ldflags "-X main.version=<tag>".
+// Falls back to "dev" when running outside of a release build.
+var version = "dev"
 
 func main() {
 	// Handle subcommands before flag parsing.
