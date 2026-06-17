@@ -49,6 +49,49 @@ sqlmcp setup
 
 ---
 
+## Multiple databases
+
+Run one `sqlmcp` instance per database and give each a distinct name in your config. The AI will see them as separate servers with prefixed tool names (`prod_query`, `staging_query`, etc.) so there is no ambiguity about which database a tool call targets.
+
+**opencode** — edit `opencode.json`:
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "prod": {
+      "type": "local",
+      "command": ["/path/to/sqlmcp", "-driver", "postgres", "-dsn", "postgres://user:password@prod-host:5432/mydb?sslmode=disable"],
+      "enabled": true
+    },
+    "staging": {
+      "type": "local",
+      "command": ["/path/to/sqlmcp", "-driver", "postgres", "-dsn", "postgres://user:password@staging-host:5432/mydb?sslmode=disable"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Claude Desktop / Cursor / Kiro**:
+```json
+{
+  "mcpServers": {
+    "prod": {
+      "command": "/path/to/sqlmcp",
+      "args": ["-driver", "postgres", "-dsn", "postgres://user:password@prod-host:5432/mydb?sslmode=disable"]
+    },
+    "staging": {
+      "command": "/path/to/sqlmcp",
+      "args": ["-driver", "postgres", "-dsn", "postgres://user:password@staging-host:5432/mydb?sslmode=disable"]
+    }
+  }
+}
+```
+
+Each instance starts only when a tool call is made to it and shuts down when idle, so having several configured has no overhead until they are actually used.
+
+---
+
 ## Manual setup
 
 If you prefer to configure things yourself:
