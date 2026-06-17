@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -249,9 +250,9 @@ func registerDescribeTable(s *server.MCPServer, db *sql.DB) {
 		}
 		schema := req.GetString("schema", "")
 
-		query := buildDescribeQuery(table, schema)
+		q, args := buildDescribeQuery(table, schema)
 
-		rows, err := db.QueryContext(ctx, query)
+		rows, err := db.QueryContext(ctx, q, args...)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("describe_table error: %v", err)), nil
 		}
@@ -266,21 +267,20 @@ func registerDescribeTable(s *server.MCPServer, db *sql.DB) {
 	})
 }
 
-func buildDescribeQuery(table, schema string) string {
-	schemaFilter := ""
+// buildDescribeQuery returns a parameterized INFORMATION_SCHEMA query and its
+// arguments. Using bound parameters avoids any issues with special characters
+// in table or schema names (e.g. apostrophes).
+func buildDescribeQuery(table, schema string) (string, []any) {
 	if schema != "" {
-		schemaFilter = fmt.Sprintf(" AND TABLE_SCHEMA = '%s'", schema)
+		return "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY " +
+			"FROM INFORMATION_SCHEMA.COLUMNS " +
+			"WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ? " +
+			"ORDER BY ORDINAL_POSITION", []any{table, schema}
 	}
-
-	return fmt.Sprintf(
-		"SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY "+
-			"FROM INFORMATION_SCHEMA.COLUMNS "+
-			"WHERE TABLE_NAME = '%s'%s "+
-			"ORDER BY ORDINAL_POSITION",
-		// Sanitise table name: strip single quotes to prevent basic injection.
-		strings.ReplaceAll(table, "'", "''"),
-		schemaFilter,
-	)
+	return "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY " +
+		"FROM INFORMATION_SCHEMA.COLUMNS " +
+		"WHERE TABLE_NAME = ? " +
+		"ORDER BY ORDINAL_POSITION", []any{table}
 }
 
 // ---------------------------------------------------------------------------
@@ -302,9 +302,24 @@ func RegisterSQLiteDescribeTable(s *server.MCPServer, db *sql.DB) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// SQLite PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+		// Validate the table name exists in sqlite_master via a parameterized
+		// query before passing it to PRAGMA, which doesn't support bound params.
+		var resolvedName string
+		err = db.QueryRowContext(ctx,
+			"SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+			table,
+		).Scan(&resolvedName)
+		if err == sql.ErrNoRows {
+			return mcp.NewToolResultError(fmt.Sprintf("table %q not found", table)), nil
+		}
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("describe_table error: %v", err)), nil
+		}
+
+		// resolvedName came from the database itself, not the user, so it is
+		// safe to interpolate into the PRAGMA statement.
 		rows, err := db.QueryContext(ctx,
-			fmt.Sprintf("PRAGMA table_info(%q)", table),
+			fmt.Sprintf("PRAGMA table_info(%q)", resolvedName),
 		)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("describe_table error: %v", err)), nil
@@ -543,6 +558,12 @@ func runAndNormalize(ctx context.Context, db *sql.DB, query string, params map[s
 
 // substitutePlaceholders replaces {{name}} tokens in query with the
 // corresponding value from params. nil values become NULL.
+//
+// String values have single quotes doubled, which is standard SQL escaping and
+// works correctly on PostgreSQL, SQLite, and SQL Server. MySQL requires
+// NO_BACKSLASH_ESCAPES mode to be set for this to be fully safe with values
+// that contain backslashes — if your MySQL data contains backslashes, set that
+// mode on the connection.
 func substitutePlaceholders(query string, params map[string]any) string {
 	for k, v := range params {
 		var replacement string
@@ -551,7 +572,6 @@ func substitutePlaceholders(query string, params map[string]any) string {
 		} else {
 			switch val := v.(type) {
 			case string:
-				// Escape single quotes to prevent syntax errors.
 				replacement = "'" + strings.ReplaceAll(val, "'", "''") + "'"
 			case bool:
 				if val {
@@ -559,6 +579,21 @@ func substitutePlaceholders(query string, params map[string]any) string {
 				} else {
 					replacement = "FALSE"
 				}
+			case float64:
+				// Guard against non-finite values that are not valid SQL literals.
+				if math.IsNaN(val) || math.IsInf(val, 0) {
+					replacement = "NULL"
+				} else if val == math.Trunc(val) && !math.IsInf(val, 0) {
+					// Render whole numbers without a decimal point to avoid
+					// float formatting issues like 1e+06.
+					replacement = fmt.Sprintf("%d", int64(val))
+				} else {
+					replacement = fmt.Sprintf("%g", val)
+				}
+			case int:
+				replacement = fmt.Sprintf("%d", val)
+			case int64:
+				replacement = fmt.Sprintf("%d", val)
 			default:
 				replacement = fmt.Sprintf("%v", val)
 			}
